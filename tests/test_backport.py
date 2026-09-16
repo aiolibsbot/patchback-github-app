@@ -1,6 +1,7 @@
 """Tests for the git plumbing behind the backport branches."""
 
 import os
+import pathlib
 import subprocess
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from patchback.backport import (
     backport_pr_sync,
     clip_output,
+    explain_push_rejection,
     run_proc,
     sanitize_secret,
 )
@@ -212,3 +214,81 @@ def test_clip_output_marks_the_truncation():
     clipped = clip_output('x' * 20, limit=5)
 
     assert clipped == 'xxxxx\n[... truncated ...]'
+
+
+@pytest.mark.parametrize(
+    ('output', 'expected'),
+    (
+        pytest.param(
+            'remote: error: GH013: Repository rule violations found for '
+            'refs/heads/patchback/backport-main-deadbeef-pr-42.\n'
+            'remote: - Cannot create ref due to creations being restricted.',
+            'ruleset',
+            id='ruleset',
+        ),
+        pytest.param(
+            'remote: error: GH006: Protected branch update failed for '
+            'refs/heads/stable.\n'
+            'remote: error: Changes must be made through a pull request.',
+            'branch protection rule',
+            id='branch-protection',
+        ),
+        pytest.param(
+            'remote: error: refusing to allow a GitHub App to create or '
+            "update workflow '.github/workflows/ci.yml' without "
+            '`workflows` permission',
+            '`Workflows: write` permission',
+            id='workflows',
+        ),
+        pytest.param(
+            'remote: Write access to repository not granted.\n'
+            'fatal: unable to access ...: The requested URL returned '
+            'error: 403',
+            'does not grant sufficient privileges',
+            id='fallback',
+        ),
+    ),
+)
+def test_push_rejection_is_diagnosed(output, expected):
+    """A rejected push is explained by its actual cause."""
+    assert expected in explain_push_rejection(
+        output, branch='patchback/backport-x', repo_remote='https://e/o/r',
+    )
+
+
+def test_push_rejection_hint_names_the_branch():
+    """The ruleset advice points at the branch that got turned down."""
+    assert 'patchback/backport-x' in explain_push_rejection(
+        'remote: error: GH013: Repository rule violations found',
+        branch='patchback/backport-x', repo_remote='https://e/o/r',
+    )
+
+
+def test_ruleset_violation_is_not_reported_as_a_missing_permission():
+    """A ruleset rejection must not send maintainers to the app settings."""
+    hint = explain_push_rejection(
+        'remote: error: GH013: Repository rule violations found',
+        branch='patchback/backport-x', repo_remote='https://e/o/r',
+    )
+
+    assert 'Contents: write' not in hint
+
+
+def test_rejected_push_surfaces_the_remote_explanation(upstream_repo):
+    """Check that a server-side rejection reaches the maintainers."""
+    hook = pathlib.Path(upstream_repo['remote'], 'hooks', 'pre-receive')
+    hook.write_text(
+        '#!/bin/sh\n'
+        'echo "GH013: Repository rule violations found" >&2\n'
+        'exit 1\n',
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(PermissionError) as exc_info:
+        backport(upstream_repo, 'plain_sha', 'stable-clean')
+
+    report = str(exc_info.value)
+
+    assert 'ruleset' in report
+    assert 'Bypass list' in report
+    assert 'GH013' in report

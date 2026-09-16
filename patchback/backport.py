@@ -8,6 +8,7 @@ testable — without a web framework in the picture.
 
 import logging
 import pathlib
+import re
 import tempfile
 from subprocess import STDOUT, CalledProcessError, check_output
 
@@ -125,6 +126,73 @@ def format_conflict_report(git_cmd, proc_err, sanitize) -> str:
     )
 
 
+# Git surfaces every server-side rejection through the same non-zero
+# exit code, so the reason has to be recovered from the text GitHub
+# sends back over the side-band. The patterns below are ordered from the
+# most specific diagnosis to the least.
+RULESET_PUSH_HINT = """\
+A repository **ruleset** rejected the push of `{branch!s}`.
+
+Rulesets apply to @patchback just like they do to humans, so the app
+has to be exempted explicitly: go to _Settings → Rules → Rulesets_, open
+the ruleset named in the output below, and add **Patchback** to its
+**Bypass list** (_Add bypass → Integrations_).
+"""
+
+BRANCH_PROTECTION_PUSH_HINT = """\
+A **branch protection rule** rejected the push of `{branch!s}`.
+
+Classic branch protection has no bypass list that a GitHub App can be
+added to. Either narrow the rule's branch name pattern so that it stops
+matching the backport branches (they all start with `patchback/`), or
+migrate the rule to a repository ruleset, where **Patchback** can be
+added to the bypass list.
+"""
+
+WORKFLOWS_PUSH_HINT = """\
+The backported commit touches `.github/workflows/`, and the current
+GitHub App installation is not allowed to push such changes.
+
+Grant the installation the `Workflows: write` permission, or backport
+this one by hand.
+"""
+
+MISSING_PRIVILEGES_PUSH_HINT = """\
+Current GitHub App installation does not grant sufficient privileges for
+pushing to {repo_remote!s}. Lacking `Contents: write` or
+`Workflows: write` permissions are known to cause this.
+"""
+
+PUSH_REJECTION_HINTS = (
+    (re.compile(r'GH013|repository rule violations', re.IGNORECASE),
+     RULESET_PUSH_HINT),
+    (re.compile(r'GH006|protected branch', re.IGNORECASE),
+     BRANCH_PROTECTION_PUSH_HINT),
+    (re.compile(r'without [`\'"]?workflows?[`\'"]? permission',
+                re.IGNORECASE),
+     WORKFLOWS_PUSH_HINT),
+)
+
+
+def explain_push_rejection(
+        output: str, *, branch: str, repo_remote: str,
+) -> str:
+    """Return the remediation advice matching a failed push.
+
+    A rejected push is not necessarily a missing-permission problem:
+    rulesets and branch protection turn down pushes the installation is
+    otherwise entitled to make, and each of those needs the maintainer
+    to act somewhere else entirely.
+    """
+    for pattern, hint in PUSH_REJECTION_HINTS:
+        if pattern.search(output):
+            break
+    else:
+        hint = MISSING_PRIVILEGES_PUSH_HINT
+
+    return hint.format(branch=branch, repo_remote=repo_remote)
+
+
 def backport_pr_sync(
         pr_number: int, merge_commit_sha: str, target_branch: str,
         backport_pr_branch: str,
@@ -231,11 +299,13 @@ def backport_pr_sync(
             cmd_log = format_proc_err(proc_err, sanitize)
             logger.error('Failed to push the backport branch: %s', cmd_log)
 
+            hint = explain_push_rejection(
+                sanitize(proc_err.output or ''),
+                branch=backport_pr_branch, repo_remote=repo_remote,
+            )
+
             raise PermissionError(
-                'Current GitHub App installation does not grant sufficient '
-                f'privileges for pushing to {repo_remote}. Lacking '
-                '`Contents: write` or `Workflows: write` permissions '
-                'are known to cause this.\n\n'
+                f'{hint!s}\n'
                 'the underlying command output was:\n\n'
                 f'{cmd_log!s}',
             ) from proc_err
